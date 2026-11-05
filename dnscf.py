@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloudflare DNS 更新器
-获取优选 IP 并更新 Cloudflare DNS 记录
+获取优选 IP 并更新 Cloudflare DNS 记录（仅失败时通知）
 """
 
 import json
@@ -97,7 +97,7 @@ def update_dns_record(record_info, name, cf_ip):
         cf_ip: 新的 IP 地址
 
     Returns:
-        操作结果字符串
+        (is_success, message): 是否成功的布尔值(成功/跳过均为True)，以及操作结果字符串
     """
     record_id = record_info['id']
     current_ip = record_info.get('content', '')
@@ -106,7 +106,7 @@ def update_dns_record(record_info, name, cf_ip):
     if current_ip == cf_ip:
         current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         print(f"cf_dns_change skip: ---- Time: {current_time} ---- ip：{cf_ip} (已是最新)")
-        return f"ip:{cf_ip} 解析 {name} 跳过 (已是最新)"
+        return True, f"ip:{cf_ip} 解析 {name} 跳过 (已是最新)"
 
     url = f'https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records/{record_id}'
     data = {
@@ -121,15 +121,15 @@ def update_dns_record(record_info, name, cf_ip):
 
         if response.status_code == 200:
             print(f"cf_dns_change success: ---- Time: {current_time} ---- ip：{cf_ip}")
-            return f"ip:{cf_ip} 解析 {name} 成功"
+            return True, f"ip:{cf_ip} 解析 {name} 成功"
         else:
             print(f"cf_dns_change ERROR: ---- Time: {current_time} ---- MESSAGE: {response.text}")
-            return f"ip:{cf_ip} 解析 {name} 失败"
+            return False, f"ip:{cf_ip} 解析 {name} 失败: {response.text}"
     except Exception as e:
         traceback.print_exc()
         current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         print(f"cf_dns_change ERROR: ---- Time: {current_time} ---- MESSAGE: {e}")
-        return f"ip:{cf_ip} 解析 {name} 失败"
+        return False, f"ip:{cf_ip} 解析 {name} 异常: {e}"
 
 
 def push_plus(content):
@@ -146,7 +146,7 @@ def push_plus(content):
     url = 'http://www.pushplus.plus/send'
     data = {
         "token": PUSHPLUS_TOKEN,
-        "title": "IP优选DNSCF推送",
+        "title": "IP优选DNSCF失败告警",
         "content": content,
         "template": "markdown",
         "channel": "wechat"
@@ -164,24 +164,32 @@ def main():
     """主函数"""
     # 检查必要的环境变量
     if not all([CF_API_TOKEN, CF_ZONE_ID, CF_DNS_NAME]):
-        print("错误: 缺少必要的环境变量 (CF_API_TOKEN, CF_ZONE_ID, CF_DNS_NAME)")
+        msg = "错误: 缺少必要的环境变量 (CF_API_TOKEN, CF_ZONE_ID, CF_DNS_NAME)"
+        print(msg)
+        push_plus(msg)
         return
 
     # 获取最新优选 IP
     ip_addresses_str = get_cf_speed_test_ip()
     if not ip_addresses_str:
-        print("错误: 无法获取优选 IP")
+        msg = "错误: 无法获取优选 IP（接口请求失败）"
+        print(msg)
+        push_plus(msg)
         return
 
     ip_addresses = [ip.strip() for ip in ip_addresses_str.split(',') if ip.strip()]
     if not ip_addresses:
-        print("错误: 未解析到有效 IP 地址")
+        msg = "错误: 未解析到有效 IP 地址"
+        print(msg)
+        push_plus(msg)
         return
 
     # 获取 DNS 记录
     dns_records = get_dns_records(CF_DNS_NAME)
     if not dns_records:
-        print(f"错误: 未找到 {CF_DNS_NAME} 的 DNS 记录")
+        msg = f"错误: 未找到 {CF_DNS_NAME} 的 DNS 记录或获取记录失败"
+        print(msg)
+        push_plus(msg)
         return
 
     # 检查记录数量是否足够
@@ -189,15 +197,16 @@ def main():
         print(f"警告: IP 数量({len(ip_addresses)})超过 DNS 记录数量({len(dns_records)})，只更新前 {len(dns_records)} 个")
         ip_addresses = ip_addresses[:len(dns_records)]
 
-    # 更新 DNS 记录
-    push_plus_content = []
+    # 更新 DNS 记录，仅收集失败记录
+    error_messages = []
     for index, ip_address in enumerate(ip_addresses):
-        dns = update_dns_record(dns_records[index], CF_DNS_NAME, ip_address)
-        push_plus_content.append(dns)
+        is_success, msg = update_dns_record(dns_records[index], CF_DNS_NAME, ip_address)
+        if not is_success:
+            error_messages.append(msg)
 
-    # 发送推送
-    if push_plus_content:
-        push_plus('\n'.join(push_plus_content))
+    # 仅在存在失败记录时发送推送
+    if error_messages:
+        push_plus('\n\n'.join(error_messages))
 
 
 if __name__ == '__main__':
